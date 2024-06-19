@@ -1,41 +1,74 @@
-import gym
+import os
+import gymnasium as gym
 import torch
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
-from pytorch_lightning.loggers import WandbLogger
+import torch.optim as optim
+import wandb
 from src.dataloader import EnvDataLoader
 from src.agent import PPO
 
-# Callback for testing
-class TestCallback(Callback):
-    def __init__(self, env, agent):
-        self.env = env
-        self.agent = agent
-    
-    def on_validation_epoch_end(self, trainer, pl_module):
-        state = self.env.reset()
-        done = False
-        total_reward = 0
-        while not done:
-            action, _ = self.agent.act(state)
-            state, reward, done, _ = self.env.step(action)
-            total_reward += reward
-        trainer.logger.experiment.log({'test_reward': total_reward})
+
+def test_agent(env, agent):
+    """Test the agent in the given environment and log the total reward."""
+    env.render()            # Render the environment to display the graphical interface
+    state = env.reset()[0]  # Reset the environment to get the initial state
+    done = False            # Flag to check if the episode has ended
+    total_reward = 0        # Variable to accumulate the total reward
+    while not done:
+        action, _ = agent.act(state)               # Get the action from the agent
+        state, reward, done, truncated, info = env.step(action)  # Take a step in the environment
+        total_reward += reward                      # Accumulate the reward
+    return total_reward
+
+def train(env, agent, n_episodes, n_steps, log_interval, save_path):
+    """Train the PPO agent in the given environment."""
+    optimizer = optim.Adam(agent.policy.parameters(), lr=agent.lr)
+    for episode in range(n_episodes):
+        state = env.reset()[0]
+        for step in range(n_steps):
+            action, log_prob = agent.act(state)
+            next_state, reward, done, truncated, info = env.step(action)
+            agent.store_transition(state, action, reward, next_state, done, log_prob)
+            state = next_state
+            
+            if done:
+                break
+
+        if (episode + 1) % log_interval == 0:
+            total_reward = test_agent(env, agent)
+            agent.save(save_path)
+            print(f'Episode {episode + 1}/{n_episodes}, Total Reward: {total_reward}')
+            # Log metrics to wandb
+            wandb.log({'Total Reward': total_reward})
 
 def main():
-    # Training
-    env = gym.make('LunarLander-v2')
+    # Initialize the Lunar Lander environment 
+    # human or rgb_array render for visualization
+    env = gym.make('LunarLander-v2', render_mode=None)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
+    # Initialize wandb
+    wandb.init(project="lunar-lander-ppo", entity="gitglob")
+
+    # Initialize the Agent
     agent = PPO(state_dim, action_dim)
 
-    wandb_logger = WandbLogger(project='lunar-lander-ppo')
-    trainer = pl.Trainer(max_epochs=1000, logger=wandb_logger, callbacks=[TestCallback(env, agent)])
+    # Load the model if a checkpoint exists
+    save_path = 'checkpoints/ppo_model.pth'
+    if os.path.exists(save_path):
+        agent.load(save_path)
+        print(f'Model loaded from {save_path}')
 
-    dataloader = torch.utils.data.DataLoader(EnvDataLoader(env, agent, n_steps=2000), batch_size=None)
+    # Training parameters
+    n_episodes = 1000
+    n_steps = 2000
+    log_interval = 20
 
-    trainer.fit(agent, dataloader)
+    # Train the agent
+    train(env, agent, n_episodes, n_steps, log_interval, save_path)
+
+    # Finish wandb run
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

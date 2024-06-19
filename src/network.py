@@ -3,40 +3,53 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 
-# PPO Network
-class PPOActorCritic(nn.Module):
+# Policy (Actor) Network
+class PolicyNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
-        super(PPOActorCritic, self).__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, action_dim),
-            nn.Softmax(dim=-1)
+        super(PolicyNetwork, self).__init__()
+        # Define the policy network
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, 128),  # First hidden layer
+            nn.ReLU(),                  # Activation function
+            nn.Linear(128, 64),         # Second hidden layer
+            nn.ReLU(),                  # Activation function
+            nn.Linear(64, action_dim),  # Output layer
+            nn.Softmax(dim=-1)          # Softmax activation for action probabilities
         )
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-        
-    def forward(self):
-        raise NotImplementedError
+    
+    def forward(self, state):
+        # Forward pass through the policy network to get action probabilities
+        return self.network(state)
     
     def act(self, state):
-        action_probs = self.actor(state)
+        # Forward pass through policy network to get action probabilities
+        action_probs = self.forward(state)
+
+        # Create a categorical distribution based on action probabilities
         dist = Categorical(action_probs)
+        
+        # Sample an action from the distribution
         action = dist.sample()
-        return action.item(), dist.log_prob(action), dist.entropy()
+
+        # Return the sampled action, its log probability, and the entropy of the distribution
+        return action, dist.log_prob(action), dist.entropy()
+
+# Value Function (Critic) Network
+class ValueNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim=1):
+        super(ValueNetwork, self).__init__()
+        # Define the value function network
+        self.network = nn.Sequential(
+            nn.Linear(state_dim+action_dim, 128),  # First hidden layer
+            nn.ReLU(),                  # Activation function
+            nn.Linear(128, 64),         # Second hidden layer
+            nn.ReLU(),                  # Activation function
+            nn.Linear(64, 1)            # Output layer for state value
+        )
     
-    def evaluate(self, state, action):
-        action_probs = self.actor(state)
-        dist = Categorical(action_probs)
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_value = self.critic(state)
-        return action_logprobs, torch.squeeze(state_value), dist_entropy
+    def forward(self, state, action):
+        # Forward pass through the value function network to get state value
+        state_action = torch.cat((state, action), -1)
+    
+        return self.network(state_action)
     

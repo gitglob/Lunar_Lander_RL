@@ -1,2 +1,7 @@
+checkpoints/*
+!checkpoints/.gitkeep 
+
+wandb
+
 .venv
 **__pycache__
