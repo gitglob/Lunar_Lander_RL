@@ -7,26 +7,26 @@ from .network import PolicyNetwork, ValueNetwork
 class PPO:
     def __init__(self, state_dim, action_dim, lr=0.002, gamma=0.99, k_epochs=4, eps_clip=0.2):
         # Initialize the Policy (Actor) network
-        self.policy = PolicyNetwork(state_dim, action_dim)
-        self.policy_old = PolicyNetwork(state_dim, action_dim)
+        self.actor = PolicyNetwork(state_dim, action_dim)
+        self.actor_old = PolicyNetwork(state_dim, action_dim)
         
         # Initialize value function (critic) network
-        self.value_function = ValueNetwork(state_dim)
-        self.value_function_old = ValueNetwork(state_dim)
+        self.critic = ValueNetwork(state_dim)
+        self.critic_old = ValueNetwork(state_dim)
 
         # Move policy and value function networks to CUDA
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.policy.to(self.device)
-        self.value_function.to(self.device)
-        self.policy_old.to(self.device)
-        self.value_function_old.to(self.device)
+        self.actor.to(self.device)
+        self.critic.to(self.device)
+        self.actor_old.to(self.device)
+        self.critic_old.to(self.device)
 
         # Initially copy the weights from the current networks to the old networks
-        self.policy_old.load_state_dict(self.policy.state_dict())
-        self.value_function_old.load_state_dict(self.value_function.state_dict())
+        self.actor_old.load_state_dict(self.actor.state_dict())
+        self.critic_old.load_state_dict(self.critic.state_dict())
     
         # Initialize the optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
+        self.optimizer = optim.AdamW(self.actor.parameters(), lr=lr)
         
         # Initialize training parameters
         self.lr = lr              # Learning Rate
@@ -36,7 +36,6 @@ class PPO:
 
         # Initialize logging parameters
         self.memory = []          # Buffer to store experiences
-        self.log_interval = 20    # Interval for logging
 
         # Keep track of loss
         self.loss = None
@@ -46,14 +45,14 @@ class PPO:
         # Select action based on current policy
         with torch.no_grad():
             state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            action, log_prob, _ = self.policy_old.act(state)
+            action, log_prob, _ = self.actor_old.act(state)
         
         return action.item(), log_prob
     
     def evaluate(self, states, actions):
         # Evaluate actions taken using current policy
-        _, log_probs, entropy = self.policy.act(states)
-        state_value = self.value_function(states, actions)
+        _, log_probs, entropy = self.actor.act(states)
+        state_value = self.critic(states, actions)
 
         return log_probs, torch.squeeze(state_value), entropy
     
@@ -78,7 +77,7 @@ class PPO:
         """Update the policy based on collected experiences"""
         ## Collect Experiences from the episode
         # Extract rewards from memory
-        rewards = [m['reward'] for m in self.memory]
+        rewards = self.normalize_rewards([m['reward'] for m in self.memory])
         # Extract states from memory
         states = [m['state'] for m in self.memory]
         # Extract actions from memory
@@ -88,8 +87,6 @@ class PPO:
         # Extract masks (indicating whether the episode continues) from memory
         masks = [m['mask'] for m in self.memory]
         # Extract the last action
-        if len(actions) == 0:
-            breakpoint()
         last_action = actions[-1].unsqueeze(0)
         if not isinstance(last_action, torch.Tensor):
             last_action = torch.LongTensor(last_action).to(self.device).unsqueeze(0)
@@ -101,7 +98,7 @@ class PPO:
         ## Compute the discounted returns for each state in the episode
         # Compute the value of the next state using the critic network, without tracking gradients
         with torch.no_grad():
-            next_value = self.value_function(next_state, last_action)  # Get value of next state
+            next_value = self.critic(next_state, last_action)  # Get value of next state
         
         # Compute the returns for each time step in the episode using the rewards and masks
         returns = self.compute_returns(next_value, rewards, masks)
@@ -113,11 +110,18 @@ class PPO:
         # Compute the state values using the critic network
         states = torch.stack(states).to(self.device)
         actions = torch.stack(actions)
-        values = self.value_function(states, actions).squeeze()
+        values = self.critic(states, actions).squeeze()
         
         ## Calculate the advantage for each state-action pair
         # Compute the advantage by subtracting state values (estimated returns) from (actual) returns
         advantage = returns - values
+        
+        # Initialize accumulators for logging
+        total_actor_loss = 0
+        total_critic_loss = 0
+        total_loss = 0
+        total_actor_grad_norms = 0
+        total_critic_grad_norms = 0
         
         ## Perform policy updates for k epochs
         for _ in range(self.k_epochs):
@@ -132,23 +136,70 @@ class PPO:
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantage.detach()
             
             # Compute the overall loss: the minimum of surrogate losses, value loss, and entropy bonus
-            self.loss = -torch.min(surr1, surr2) + 0.5 * nn.MSELoss()(state_values, returns) - 0.01 * dist_entropy
-
+            actor_loss = -torch.min(surr1, surr2)
+            critic_loss = nn.MSELoss()(state_values, returns)
+            loss = actor_loss + 0.5*critic_loss - 0.01 * dist_entropy
+            
+            # Accumulate losses
+            total_actor_loss += actor_loss.mean().item()
+            total_critic_loss += critic_loss.mean().item()
+            total_loss += loss.mean().item()
+            
             # Zero the gradients of the optimizer
             self.optimizer.zero_grad()
             
             # Backpropagate the loss
-            self.loss.mean().backward()
+            loss.mean().backward()
             
+            # Save the gradients before clipping
+            actor_grad_norms = []
+            for param in self.actor.parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    actor_grad_norms.append(grad_norm)
+            avg_actor_grad_norm = sum(actor_grad_norms) / len(actor_grad_norms)
+            total_actor_grad_norms += avg_actor_grad_norm
+            
+            critic_grad_norms = []
+            for param in self.critic.parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    critic_grad_norms.append(grad_norm)
+            avg_critic_grad_norm = sum(critic_grad_norms) / len(critic_grad_norms)
+            total_critic_grad_norms += avg_critic_grad_norm
+            
+            # Clip gradients
+            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
+
             # Perform a single optimization step
             self.optimizer.step()
+
+        # Compute averages over k_epochs
+        avg_actor_loss = total_actor_loss / self.k_epochs
+        avg_critic_loss = total_critic_loss / self.k_epochs
+        avg_loss = total_loss / self.k_epochs
+        avg_actor_grad_norms = total_actor_grad_norms / self.k_epochs
+        avg_critic_grad_norms = total_critic_grad_norms / self.k_epochs
         
+        # Log dictionary
+        log_dict = {
+            "Average Reward": np.mean(rewards),
+            "Average Loss": avg_loss,
+            "Average Actor Loss": avg_actor_loss,
+            "Average Critic Loss": avg_critic_loss,
+            "Averange Critic Gradient": avg_critic_grad_norms,
+            "Averange Actor Gradient": avg_actor_grad_norms
+        }
+                
         # Update old policy and value function networks
-        self.policy_old.load_state_dict(self.policy.state_dict())
-        self.value_function_old.load_state_dict(self.value_function.state_dict())
+        self.actor_old.load_state_dict(self.actor.state_dict())
+        self.critic_old.load_state_dict(self.critic.state_dict())
 
         # Clear the memory buffer
         self.memory = []
+
+        return log_dict
 
     def store_transition(self, state, action, reward, next_state, done, log_prob):
         # Store the experience in memory
@@ -165,19 +216,26 @@ class PPO:
         })
 
         # Update the policy if the memory buffer is full
-        if len(self.memory) >= self.log_interval:
-            self.update()
-            avg_reward = np.mean([m['reward'] for m in self.memory])
-
+        log_dict = None
+        if done:
+            log_dict = self.update()
+        return log_dict
+        
+    @staticmethod
+    def normalize_rewards(rewards):
+        rewards = np.array(rewards)
+        normalized_rewards = (rewards - rewards.max()) / (rewards.std() + 1e-8)
+        return normalized_rewards.tolist()
+        
     def load(self, filename):
         checkpoint = torch.load(filename)
-        self.policy.load_state_dict(checkpoint['policy'])
-        self.value_function.load_state_dict(checkpoint['value_function'])
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.critic.load_state_dict(checkpoint['critic'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
 
     def save(self, filename):
         torch.save({
-            'policy': self.policy.state_dict(),
-            'value_function': self.value_function.state_dict(),
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
             'optimizer': self.optimizer.state_dict(),
         }, filename)
