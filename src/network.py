@@ -9,11 +9,13 @@ class PolicyNetwork(nn.Module):
         super(PolicyNetwork, self).__init__()
         # Define the policy network
         self.network = nn.Sequential(
-            nn.Linear(state_dim, 128),  # First hidden layer
+            nn.Linear(state_dim, 256),  # First hidden layer
+            nn.LayerNorm(256),
             nn.ReLU(),                  # Activation function
-            nn.Linear(128, 64),         # Second hidden layer
+            nn.Linear(256, 128),         # Second hidden layer
+            nn.LayerNorm(128),
             nn.ReLU(),                  # Activation function
-            nn.Linear(64, action_dim),  # Output layer
+            nn.Linear(128, action_dim),  # Output layer
             nn.Softmax(dim=-1)          # Softmax activation for action probabilities
         )
     
@@ -40,11 +42,13 @@ class ValueNetwork(nn.Module):
         super(ValueNetwork, self).__init__()
         # Define the value function network
         self.network = nn.Sequential(
-            nn.Linear(state_dim+action_dim, 128),  # First hidden layer
+            nn.Linear(state_dim+action_dim, 256),  # First hidden layer
+            nn.LayerNorm(256),
             nn.ReLU(),                  # Activation function
-            nn.Linear(128, 64),         # Second hidden layer
+            nn.Linear(256, 128),         # Second hidden layer
+            nn.LayerNorm(128),
             nn.ReLU(),                  # Activation function
-            nn.Linear(64, 1)            # Output layer for state value
+            nn.Linear(128, 1)            # Output layer for state value
         )
     
     def forward(self, state, action):
