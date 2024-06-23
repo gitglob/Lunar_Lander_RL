@@ -62,7 +62,7 @@ def train(env_train, agent, n_episodes,
             norm_state = norm_next_state
             
             # Break if the episode is over
-            if done or timestep % batch_size == 0:
+            if done or truncated or timestep % batch_size == 0:
                 break
 
         # Update the agent's actor and critic networks
@@ -90,20 +90,18 @@ def main():
     action_dim = env_train.action_space.n
 
     # Initialize wandb
-    run_id = "v11-norm_states_disc_rewards_clip_lr_anneal2"
+    run_id = "v12-common_optimizer"
     wandb.init(project="lunar-lander-ppo", entity="gitglob", resume='allow', id=run_id)
 
     # Set and log the hyperparameters
-    lr_a=0.001
-    lr_c=0.001
+    lr=0.001
     gamma=0.99
     entropy_coef = 0.01
     entropy_decay_rate = 0
     k_epochs=4
     eps_clip=0.2
     wandb.config.update({
-        "lr_a": lr_a,
-        "lr_c": lr_c,
+        "lr": lr,
         "gamma": gamma,
         "entropy_decay_rate": entropy_decay_rate,
         "entropy_coef": entropy_coef,
@@ -113,7 +111,7 @@ def main():
 
     # Initialize the Agent
     agent = PPO(state_dim, action_dim, 
-                lr_a, lr_c, gamma, 
+                lr, gamma, 
                 entropy_decay_rate, entropy_coef,
                 k_epochs, eps_clip)
 
@@ -126,7 +124,7 @@ def main():
     # Training parameters
     n_episodes = 20000
     n_steps = 500
-    batch_size = 100
+    batch_size = 128
     save_every = 5
     log_interval = 25
 

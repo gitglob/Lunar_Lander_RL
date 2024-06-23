@@ -7,7 +7,7 @@ from .network import PolicyNetwork, ValueNetwork
 
 class PPO:
     def __init__(self, state_dim, action_dim, 
-                 lr_a=0.001, lr_c=0.001, gamma=0.99, 
+                 lr=0.001, gamma=0.99, 
                  entropy_decay_rate=0, entropy_coef=0.01,
                  k_epochs=4, eps_clip=0.2):
         # Initialize the Policy (Actor) network
@@ -34,12 +34,10 @@ class PPO:
         self.critic_old.load_state_dict(self.critic.state_dict())
     
         # Initialize the optimizer
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_a)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_c)
+        self.optimizer = optim.Adam(self.actor.parameters(), lr=lr)
 
         # Define learning rate schedulers
-        self.actor_scheduler = StepLR(self.actor_optimizer, step_size=1000, gamma=0.8)
-        self.critic_scheduler = StepLR(self.critic_optimizer, step_size=1000, gamma=0.8)
+        self.scheduler = StepLR(self.optimizer, step_size=1000, gamma=0.8)
         
         # Initialize training parameters
         self.gamma = gamma        # Discount Factor
@@ -68,13 +66,6 @@ class PPO:
             action, log_prob, _ = self.actor_old.act(state)
         
         return action.item(), log_prob
-    
-    def evaluate(self, states):
-        # Evaluate actions taken using current policy
-        _, log_probs, entropy = self.actor.act(states)
-        state_value = self.critic(states)
-
-        return log_probs, torch.squeeze(state_value), entropy
     
     def compute_gae(self, rewards, values, masks, next_value):
         values = values + [next_value]
@@ -105,16 +96,11 @@ class PPO:
         # clipped_rewards = [np.clip(m['reward'], -1, 1) for m in self.memory]
         states = [m['state'] for m in self.memory]
         states = torch.stack(states).to(self.device)
-        actions = [m['action'] for m in self.memory]
-        actions = torch.stack(actions).to(self.device)
         log_probs = [m['log_prob'] for m in self.memory]
-        log_probs = torch.stack(log_probs).to(self.device)
+        log_probs = torch.tensor(log_probs).to(self.device)
         masks = [m['mask'] for m in self.memory]
 
         # Extract the last action and state
-        last_action = actions[-1].unsqueeze(0)
-        if not isinstance(last_action, torch.Tensor):
-            last_action = torch.LongTensor(last_action).to(self.device).unsqueeze(0)
         last_state = self.memory[-1]['next_state'].unsqueeze(0)
         if not isinstance(last_state, torch.Tensor):
             last_state = torch.FloatTensor(last_state).to(self.device).unsqueeze(0)
@@ -123,7 +109,7 @@ class PPO:
         with torch.no_grad():
             future_value = self.critic(last_state).cpu()
 
-        # Compute the returns for each time step in the episode using the rewards and masks
+        # Compute discounted rewards to help the model consider long-term action consequences
         returns = self.compute_returns(future_value, rewards, masks)
         returns = torch.FloatTensor(returns).to(self.device)
                 
@@ -146,21 +132,24 @@ class PPO:
         
         # Perform policy updates for k epochs
         for _ in range(self.k_epochs):
-            # Evaluate the current policy with the states and actions
-            action_logprobs, state_values, dist_entropy = self.evaluate(states)
-            
+            # Actor loss
+            _, new_log_probs, dist_entropy = self.actor.act(states)
             # Compute the ratio of the new and old action probabilities
-            ratios = torch.exp(action_logprobs - log_probs.detach())
-            
+            ratios = torch.exp(new_log_probs - log_probs.detach())
             # Compute the surrogate loss (PPO objective)
             surr1 = ratios * advantage
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantage
-            
-            # Compute the overall loss: the minimum of surrogate losses, value loss, and entropy bonus
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantage      
             actor_loss = -torch.min(surr1, surr2)
+
+            # Critic loss
+            state_values = self.critic(states).flatten()
             critic_loss = nn.MSELoss()(state_values, returns)
+
+            # Compute the entropy loss
             self.entropy_coef = max(self.final_entropy_coef, self.entropy_coef * self.entropy_decay_rate)
             entropy = self.entropy_coef * dist_entropy
+            
+            # Overall loss
             loss = actor_loss + critic_loss - entropy
             
             # Accumulate losses
@@ -170,8 +159,7 @@ class PPO:
             total_loss += loss.mean().item()
             
             # Zero the gradients of the optimizer
-            self.actor_optimizer.zero_grad()
-            self.critic_optimizer.zero_grad()
+            self.optimizer.zero_grad()
             
             # Backpropagate the loss
             loss.mean().backward()
@@ -189,12 +177,10 @@ class PPO:
             total_critic_clip_grad_norms += self.get_avg_grad(self.critic)
 
             # Perform a single optimization step
-            self.actor_optimizer.step()
-            self.critic_optimizer.step()
+            self.optimizer.step()
 
         # Update learning rate
-        self.actor_scheduler.step()
-        self.critic_scheduler.step()
+        self.scheduler.step()
 
         # Compute averages over k_epochs
         avg_actor_loss = total_actor_loss / self.k_epochs
@@ -205,10 +191,6 @@ class PPO:
         avg_critic_grad_norms = total_critic_grad_norms / self.k_epochs
         avg_actor_clip_grad_norms = total_actor_clip_grad_norms / self.k_epochs
         avg_critic_clip_grad_norms = total_critic_clip_grad_norms / self.k_epochs
-        
-        # Get the current learning rates
-        actor_lr = self.get_lr(self.actor_optimizer)
-        critic_lr = self.get_lr(self.critic_optimizer)
 
         # Log dictionary
         self.log_dict = {
@@ -221,8 +203,7 @@ class PPO:
             "Critic Gradient": avg_critic_grad_norms,
             "Clipped Actor Gradient": avg_actor_clip_grad_norms,
             "Clipped Critic Gradient": avg_critic_clip_grad_norms,
-            "Actor Learning Rate": actor_lr,
-            "Critic Learning Rate": critic_lr
+            "Learning Rate": self.get_lr(self.optimizer),
         }
                 
         # Update old policy and value function networks
@@ -239,7 +220,6 @@ class PPO:
         next_state = torch.FloatTensor(next_state).to(self.device)
         self.memory.append({
             'state': state,
-            'action': action,
             'reward': reward,
             'next_state': next_state,
             'mask': 1 - done,
@@ -261,25 +241,23 @@ class PPO:
         return optimizer.param_groups[0]["lr"]
         
     @staticmethod
-    def init_orthogonal(layer, gain=1.0):
+    def init_orthogonal(layer, std=2.0, bias=0.0):
         if isinstance(layer, nn.Linear):
-            torch.nn.init.orthogonal_(layer.weight, gain=gain)
+            torch.nn.init.orthogonal_(layer.weight, std)
             if layer.bias is not None:
-                torch.nn.init.constant_(layer.bias, 0)
+                torch.nn.init.constant_(layer.bias, bias)
 
     def load(self, filename):
         checkpoint = torch.load(filename)
         self.actor.load_state_dict(checkpoint["actor"])
         self.critic.load_state_dict(checkpoint["critic"])
-        self.actor_optimizer.load_state_dict(checkpoint["actor optimizer"])
-        self.critic_optimizer.load_state_dict(checkpoint["critic optimizer"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.entropy_decay_rate = checkpoint["entropy decay rate"]
 
     def save(self, filename):
         torch.save({
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
-            "actor optimizer": self.actor_optimizer.state_dict(),
-            "critic optimizer": self.critic_optimizer.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
             "entropy decay rate": self.entropy_decay_rate
         }, filename)
