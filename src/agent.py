@@ -1,15 +1,12 @@
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
 from .network import PolicyNetwork, ValueNetwork
 
 class PPO:
     def __init__(self, state_dim, action_dim, 
-                 lr=0.001, gamma=0.99, 
-                 entropy_decay_rate=0, entropy_coef=0.01,
-                 k_epochs=4, eps_clip=0.2):
+                 lr=0.001, gamma=0.99, entropy_coef=0.01,
+                 k_epochs=4, eps_clip=0.2, lam=0.95):
         # Initialize the Policy (Actor) network
         self.actor = PolicyNetwork(state_dim, action_dim)
         self.actor_old = PolicyNetwork(state_dim, action_dim)
@@ -34,10 +31,8 @@ class PPO:
         self.critic_old.load_state_dict(self.critic.state_dict())
     
         # Initialize the optimizer
-        self.optimizer = optim.Adam(self.actor.parameters(), lr=lr)
-
-        # Define learning rate schedulers
-        self.scheduler = StepLR(self.optimizer, step_size=1000, gamma=0.8)
+        self.lr = lr
+        self.optimizer = optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=self.lr)
         
         # Initialize training parameters
         self.gamma = gamma        # Discount Factor
@@ -46,17 +41,9 @@ class PPO:
 
         # Entropy configuration
         self.entropy_coef = entropy_coef
-        self.final_entropy_coef = 0.01 if entropy_decay_rate!=0 else entropy_coef
-        self.entropy_decay_rate = entropy_decay_rate
 
         # GAE configuration
-        self.lam = 0.95
-
-        # Initialize logging parameters
-        self.memory = []                         # Buffer to store experiences
-
-        # Keep track of loss
-        self.loss = None
+        self.lam = lam
 
     def act(self, state):
         # state: [x, y, v_x, v_y, theta, omega, grounded_left, grounded_right]
@@ -68,57 +55,41 @@ class PPO:
         return action.item(), log_prob
     
     def compute_gae(self, rewards, values, masks, next_value):
-        values = values + [next_value]
-        advantages = []
+        # Concatenate next_value to values
+        values = torch.cat((values, next_value))
+        
+        # Initialize advantages tensor
+        advantages = torch.zeros_like(rewards).to(self.device)
         gae = 0
+        
+        # Compute GAE
         for step in reversed(range(len(rewards))):
             delta = rewards[step] + self.gamma * values[step + 1] * masks[step] - values[step]
             gae = delta + self.gamma * self.lam * masks[step] * gae
-            advantages.insert(0, gae)
+            advantages[step] = gae
+        
         return advantages
-    
-    def compute_returns(self, next_value, rewards, masks):
-        """Calculates the discounted sum of future rewards."""
-        R = next_value
-        returns = []
-
-        for step in reversed(range(len(rewards))):
-            R = rewards[step] + self.gamma * R * masks[step]
-            returns.append(R)
-
-        returns = returns[::-1]
-        return returns
-    
-    def update(self):
+        
+    def update(self, states, log_probs, rewards, next_states, masks):
         """Update the policy based on collected experiences"""
-        # Collect Experiences from the episode
-        rewards = [m['reward'] for m in self.memory]
-        # clipped_rewards = [np.clip(m['reward'], -1, 1) for m in self.memory]
-        states = [m['state'] for m in self.memory]
-        states = torch.stack(states).to(self.device)
-        log_probs = [m['log_prob'] for m in self.memory]
-        log_probs = torch.tensor(log_probs).to(self.device)
-        masks = [m['mask'] for m in self.memory]
+        states = states.to(self.device).detach()
+        next_states = next_states.to(self.device).detach()
+        log_probs = log_probs.to(self.device).detach()
+        rewards = rewards.to(self.device).detach()
+        masks = masks.to(self.device).detach()
 
         # Extract the last action and state
-        last_state = self.memory[-1]['next_state'].unsqueeze(0)
-        if not isinstance(last_state, torch.Tensor):
-            last_state = torch.FloatTensor(last_state).to(self.device).unsqueeze(0)
+        last_state = next_states[-1]
 
-        # Compute the value of the first future state
-        with torch.no_grad():
-            future_value = self.critic(last_state).cpu()
-
-        # Compute discounted rewards to help the model consider long-term action consequences
-        returns = self.compute_returns(future_value, rewards, masks)
-        returns = torch.FloatTensor(returns).to(self.device)
-                
-        # Compute the state values using the critic network
+        # Compute discounted rewards and GAE advantages
         values = self.critic(states).squeeze()
-        
-        # Compute the advantage by subtracting state values (estimated returns) from (actual) returns
-        advantage = returns.detach() - values.detach()
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+
+        # Compute the value of the first future state, the advantages, and the returns
+        with torch.no_grad():
+            future_value = self.critic(last_state)
+            advantages = self.compute_gae(rewards, values, masks, future_value)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            returns = advantages + values
         
         # Initialize accumulators for logging
         total_actor_loss = 0
@@ -135,42 +106,45 @@ class PPO:
             # Actor loss
             _, new_log_probs, dist_entropy = self.actor.act(states)
             # Compute the ratio of the new and old action probabilities
-            ratios = torch.exp(new_log_probs - log_probs.detach())
-            # Compute the surrogate loss (PPO objective)
-            surr1 = ratios * advantage
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantage      
-            actor_loss = -torch.min(surr1, surr2)
+            ratios = torch.exp(new_log_probs - log_probs)
+            # Compute the surrogate (actor) loss (PPO objective)
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            actor_loss = -torch.min(surr1, surr2).mean()
 
             # Critic loss
-            state_values = self.critic(states).flatten()
-            critic_loss = nn.MSELoss()(state_values, returns)
+            new_values = self.critic(states).flatten()
+            critic_loss_unclipped = nn.MSELoss()(new_values, returns)
+            # new_values_clipped = values + torch.clamp(new_values-values, -self.eps_clip, self.eps_clip)
+            # critic_loss_clipped = nn.MSELoss()(new_values_clipped, returns)
+            # critic_loss = torch.max(critic_loss_unclipped, critic_loss_clipped)
+            critic_loss = critic_loss_unclipped
 
             # Compute the entropy loss
-            self.entropy_coef = max(self.final_entropy_coef, self.entropy_coef * self.entropy_decay_rate)
-            entropy = self.entropy_coef * dist_entropy
+            entropy = (self.entropy_coef * dist_entropy).mean()
             
             # Overall loss
-            loss = actor_loss + critic_loss - entropy
+            loss = actor_loss + 0.5*critic_loss - entropy
             
             # Accumulate losses
-            total_actor_loss += actor_loss.mean().item()
-            total_critic_loss += critic_loss.mean().item()
-            total_entropy += entropy.mean().item()
-            total_loss += loss.mean().item()
+            total_actor_loss += actor_loss
+            total_critic_loss += critic_loss
+            total_entropy += entropy
+            total_loss += loss
             
             # Zero the gradients of the optimizer
             self.optimizer.zero_grad()
             
             # Backpropagate the loss
-            loss.mean().backward()
+            loss.backward()
             
             # Save the gradients before clipping
             total_actor_grad_norms += self.get_avg_grad(self.actor)
             total_critic_grad_norms += self.get_avg_grad(self.critic)
             
             # Clip gradients
-            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
+            # nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
+            # nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
             
             # Save the gradients after clipping
             total_actor_clip_grad_norms += self.get_avg_grad(self.actor)
@@ -178,9 +152,6 @@ class PPO:
 
             # Perform a single optimization step
             self.optimizer.step()
-
-        # Update learning rate
-        self.scheduler.step()
 
         # Compute averages over k_epochs
         avg_actor_loss = total_actor_loss / self.k_epochs
@@ -194,7 +165,7 @@ class PPO:
 
         # Log dictionary
         self.log_dict = {
-            "Reward": np.mean(rewards),
+            "Reward": rewards.mean(),
             "Loss": self.avg_loss,
             "Entropy": self.avg_entropy,
             "Actor Loss": avg_actor_loss,
@@ -203,7 +174,7 @@ class PPO:
             "Critic Gradient": avg_critic_grad_norms,
             "Clipped Actor Gradient": avg_actor_clip_grad_norms,
             "Clipped Critic Gradient": avg_critic_clip_grad_norms,
-            "Learning Rate": self.get_lr(self.optimizer),
+            "Learning Rate": self.get_lr(),
         }
                 
         # Update old policy and value function networks
@@ -212,19 +183,6 @@ class PPO:
 
         # Clear the memory buffer
         self.memory = []
-
-    def store_transition(self, state, action, reward, next_state, done, log_prob):
-        # Store the experience in memory
-        state = torch.FloatTensor(state).to(self.device)
-        action = torch.LongTensor([action]).to(self.device)
-        next_state = torch.FloatTensor(next_state).to(self.device)
-        self.memory.append({
-            'state': state,
-            'reward': reward,
-            'next_state': next_state,
-            'mask': 1 - done,
-            'log_prob': log_prob
-        })
 
     @staticmethod
     def get_avg_grad(network):
@@ -236,9 +194,14 @@ class PPO:
         avg_grad_norm = sum(grad_norms) / len(grad_norms)
         return avg_grad_norm
 
-    @staticmethod
-    def get_lr(optimizer):
-        return optimizer.param_groups[0]["lr"]
+    def anneal_lr(self, frac):
+        self.optimizer.param_groups[0]["lr"] = self.lr * frac
+
+    def set_lr(self, lr):
+        self.optimizer.param_groups[0]["lr"] = lr
+
+    def get_lr(self):
+        return self.optimizer.param_groups[0]["lr"]
         
     @staticmethod
     def init_orthogonal(layer, std=2.0, bias=0.0):
@@ -252,12 +215,10 @@ class PPO:
         self.actor.load_state_dict(checkpoint["actor"])
         self.critic.load_state_dict(checkpoint["critic"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.entropy_decay_rate = checkpoint["entropy decay rate"]
 
     def save(self, filename):
         torch.save({
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "entropy decay rate": self.entropy_decay_rate
+            "optimizer": self.optimizer.state_dict()
         }, filename)

@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
@@ -14,7 +13,7 @@ class PolicyNetwork(nn.Module):
             nn.Linear(128, 128),
             nn.Tanh(),
             nn.Linear(128, action_dim),  # Output layer
-            nn.Softmax(dim=-1)          # Softmax activation for action probabilities
+            nn.Softmax(dim=-1)           # Softmax activation for action probabilities
         )
     
     def forward(self, state):
