@@ -2,6 +2,7 @@ import os
 import wandb
 import torch
 import gymnasium as gym
+from src.utils import normalize_and_clip_rewards, corr
 from src.agent import PPO
 
 
@@ -70,6 +71,20 @@ def train(env_train, agent,
             # Advance the state
             state = next_state
 
+        # Normalize rewards
+        batch_rewards = normalize_and_clip_rewards(batch_rewards)
+
+        # Identify terminal states
+        terminal_indices = (batch_masks == 0).nonzero(as_tuple=False).squeeze()
+
+        # Calculate terminal and penultimate terminal correlations
+        if len(terminal_indices) > 1:
+            terminal_correlation = corr(batch_values[terminal_indices], batch_rewards[terminal_indices])
+            penultimate_terminal_correlation = corr(batch_values[terminal_indices - 1], batch_rewards[terminal_indices])
+        else:
+            terminal_correlation = 0
+            penultimate_terminal_correlation = 0
+
         # Increase the update counter and update agent
         agent.update(batch_states, 
                      batch_log_probs, 
@@ -84,7 +99,17 @@ def train(env_train, agent,
 
         # Run inference to calculate the total reward
         total_reward = test(agent)
+        agent.log_dict["Rewards/Min"] = batch_rewards.min()
+        agent.log_dict["Rewards/Max"] = batch_rewards.max()
+        agent.log_dict["Rewards/Mean"] = batch_rewards.mean()
+        agent.log_dict["Rewards/Std"] = batch_rewards.std()
+        agent.log_dict["Values/Min"] = batch_values.min()
+        agent.log_dict["Values/Max"] = batch_values.max()
+        agent.log_dict["Values/Mean"] = batch_values.mean()
+        agent.log_dict["Values/Std"] = batch_values.std()
         agent.log_dict["Episode Reward"] = total_reward
+        agent.log_dict["Debug/Terminal Correlation"] = terminal_correlation
+        agent.log_dict["Debug/Penultimate Terminal Correlation"] = penultimate_terminal_correlation
         wandb.log(agent.log_dict)
         action_data = {f"action_{i}_count": batch_action_counts[i] 
                        for i in range(len(batch_action_counts))}
@@ -106,7 +131,7 @@ def main():
     action_dim = env_train.action_space.n
 
     # Initialize wandb
-    run_id = "v14.0.0"
+    run_id = "v20.0.14-debug"
     wandb.init(project="lunar-lander-ppo", 
                entity="gitglob", 
                resume='allow', 
@@ -114,7 +139,7 @@ def main():
 
     # Set and log the hyperparameters
     lr=1e-5
-    lr_anneal = False
+    lr_anneal = True
     gamma=0.99
     entropy_coef = 0.001
     k_epochs=4
@@ -139,8 +164,8 @@ def main():
         print(f"Model loaded from {save_path}")
 
     # Training parameters
-    num_updates = 1000
-    batch_size = 128
+    num_updates = 5000
+    batch_size = 1024#128
 
     # Train the agent
     train(env_train, agent, 

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from src.utils import calculate_step_statistics
 from .network import PolicyNetwork, ValueNetwork
 
 class PPO:
@@ -69,6 +70,14 @@ class PPO:
 
         return torch.tensor(returns).to(self.device)
         
+    def compute_kl_divergence(self, old_log_probs, new_log_probs):
+        """Compute the KL divergence between old and new log probabilities."""
+        kl_divergence = torch.exp(old_log_probs) * (old_log_probs - new_log_probs)
+        return kl_divergence.mean()
+
+    def max_entropy(self, action_dim=4):
+        return torch.log(torch.tensor(action_dim, dtype=torch.float32)).item()
+
     def update(self, states, log_probs, values, rewards, next_states, masks):
         """Update the policy based on collected experiences"""
         states = states.to(self.device).detach()
@@ -96,13 +105,22 @@ class PPO:
         total_critic_grad_norms = 0
         total_actor_clip_grad_norms = 0
         total_critic_clip_grad_norms = 0
+        total_kl_divergence = 0
+        total_residual_variance = 0
+
+        # Save current parameters
+        old_actor_params = [param.clone() for param in self.actor.parameters()]
+        old_critic_params = [param.clone() for param in self.critic.parameters()]
         
         # Perform policy updates for k epochs
+        batch_target_values = torch.zeros_like(values)
         for _ in range(self.k_epochs):
-            # Actor loss
+            # Use current policy to predict action, log probs and entropy
             _, new_log_probs, dist_entropy = self.actor.act(states)
+
             # Compute the ratio of the new and old action probabilities
             ratios = torch.exp(new_log_probs - log_probs)
+
             # Compute the surrogate (actor) loss (PPO objective)
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
@@ -117,11 +135,27 @@ class PPO:
             
             # Overall loss
             loss = actor_loss + 0.5*critic_loss - entropy
+        
+            # Keep the predicted values
+            batch_target_values += new_values
+
+            # Compute KL divergence
+            kl_divergence = self.compute_kl_divergence(log_probs, new_log_probs)
+            total_kl_divergence += kl_divergence.item()
+
+            # Compute residual variance
+            residual_variance = ((returns - new_values).var() / returns.var()).item()
+            total_residual_variance += residual_variance
+
+            # Compute relative policy entropy
+            policy_entropy = dist_entropy.mean().item()
+            max_ent = self.max_entropy()
+            relative_entropy = policy_entropy / max_ent
+            total_entropy += relative_entropy
             
             # Accumulate losses
             total_actor_loss += actor_loss
             total_critic_loss += critic_loss
-            total_entropy += entropy
             total_loss += loss
             
             # Zero the gradients of the optimizer
@@ -141,6 +175,10 @@ class PPO:
             # Perform a single optimization step
             self.optimizer.step()
 
+        # Calculate step statistics
+        abs_max_actor, mean_square_value_actor = calculate_step_statistics(old_actor_params, self.actor.parameters())
+        abs_max_critic, mean_square_value_critic = calculate_step_statistics(old_critic_params, self.critic.parameters())
+
         # Compute averages over k_epochs
         avg_actor_loss = total_actor_loss / self.k_epochs
         avg_critic_loss = total_critic_loss / self.k_epochs
@@ -150,19 +188,27 @@ class PPO:
         avg_critic_grad_norms = total_critic_grad_norms / self.k_epochs
         avg_actor_clip_grad_norms = total_actor_clip_grad_norms / self.k_epochs
         avg_critic_clip_grad_norms = total_critic_clip_grad_norms / self.k_epochs
+        avg_kl_divergence = total_kl_divergence / self.k_epochs
+        avg_residual_variance = total_residual_variance / self.k_epochs
+        batch_target_values = batch_target_values / self.k_epochs
 
         # Log dictionary
         self.log_dict = {
-            "Reward": rewards.mean(),
-            "Loss": self.avg_loss,
-            "Entropy": self.avg_entropy,
-            "Actor Loss": avg_actor_loss,
-            "Critic Loss": avg_critic_loss,
-            "Actor Gradient": avg_actor_grad_norms,
-            "Critic Gradient": avg_critic_grad_norms,
-            "Clipped Actor Gradient": avg_actor_clip_grad_norms,
-            "Clipped Critic Gradient": avg_critic_clip_grad_norms,
-            "Learning Rate": self.get_lr(),
+            "Loss/Total": self.avg_loss,
+            "Loss/Actor": avg_actor_loss,
+            "Loss/Critic": avg_critic_loss,
+            "Debug/Entropy": self.avg_entropy,
+            "Debug/KL Divergence": avg_kl_divergence,
+            "Debug/Residual Variance": avg_residual_variance,
+            "Gradient/Actor": avg_actor_grad_norms,
+            "Gradient/Critic": avg_critic_grad_norms,
+            "Gradient/Clipped Actor": avg_actor_clip_grad_norms,
+            "Gradient/Clipped Critic": avg_critic_clip_grad_norms,
+            "Target Values/Min": batch_target_values.min(),
+            "Target Values/Max": batch_target_values.max(),
+            "Target Values/Mean": batch_target_values.mean(),
+            "Target Values/Std": batch_target_values.std(),
+            "Config/Learning Rate": self.get_lr(),
         }
                 
         # Update old policy and value function networks
