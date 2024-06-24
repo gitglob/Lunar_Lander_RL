@@ -113,6 +113,7 @@ class PPO:
         old_critic_params = [param.clone() for param in self.critic.parameters()]
         
         # Perform policy updates for k epochs
+        batch_values = torch.zeros_like(values)
         batch_target_values = torch.zeros_like(values)
         for _ in range(self.k_epochs):
             # Use current policy to predict action, log probs and entropy
@@ -137,7 +138,8 @@ class PPO:
             loss = actor_loss + 0.5*critic_loss - entropy
         
             # Keep the predicted values
-            batch_target_values += new_values
+            batch_values += new_values
+            batch_target_values += returns
 
             # Compute KL divergence
             kl_divergence = self.compute_kl_divergence(log_probs, new_log_probs)
@@ -190,6 +192,7 @@ class PPO:
         avg_critic_clip_grad_norms = total_critic_clip_grad_norms / self.k_epochs
         avg_kl_divergence = total_kl_divergence / self.k_epochs
         avg_residual_variance = total_residual_variance / self.k_epochs
+        batch_values = batch_values / self.k_epochs
         batch_target_values = batch_target_values / self.k_epochs
 
         # Log dictionary
@@ -204,6 +207,10 @@ class PPO:
             "Gradient/Critic": avg_critic_grad_norms,
             "Gradient/Clipped Actor": avg_actor_clip_grad_norms,
             "Gradient/Clipped Critic": avg_critic_clip_grad_norms,
+            "Values/Min": batch_values.min(),
+            "Values/Max": batch_values.max(),
+            "Values/Mean": batch_values.mean(),
+            "Values/Std": batch_values.std(),
             "Target Values/Min": batch_target_values.min(),
             "Target Values/Max": batch_target_values.max(),
             "Target Values/Mean": batch_target_values.mean(),

@@ -103,10 +103,6 @@ def train(env_train, agent,
         agent.log_dict["Rewards/Max"] = batch_rewards.max()
         agent.log_dict["Rewards/Mean"] = batch_rewards.mean()
         agent.log_dict["Rewards/Std"] = batch_rewards.std()
-        agent.log_dict["Values/Min"] = batch_values.min()
-        agent.log_dict["Values/Max"] = batch_values.max()
-        agent.log_dict["Values/Mean"] = batch_values.mean()
-        agent.log_dict["Values/Std"] = batch_values.std()
         agent.log_dict["Episode Reward"] = total_reward
         agent.log_dict["Debug/Terminal Correlation"] = terminal_correlation
         agent.log_dict["Debug/Penultimate Terminal Correlation"] = penultimate_terminal_correlation
@@ -131,7 +127,7 @@ def main():
     action_dim = env_train.action_space.n
 
     # Initialize wandb
-    run_id = "v20.0.14-debug"
+    run_id = "v20.1.1-debug"
     wandb.init(project="lunar-lander-ppo", 
                entity="gitglob", 
                resume='allow', 
@@ -139,7 +135,7 @@ def main():
 
     # Set and log the hyperparameters
     lr=1e-5
-    lr_anneal = True
+    lr_anneal = False
     gamma=0.99
     entropy_coef = 0.001
     k_epochs=4
