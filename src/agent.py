@@ -6,7 +6,7 @@ from .network import PolicyNetwork, ValueNetwork
 class PPO:
     def __init__(self, state_dim, action_dim, 
                  lr=0.001, gamma=0.99, entropy_coef=0.01,
-                 k_epochs=4, eps_clip=0.2, lam=0.95):
+                 k_epochs=4, eps_clip=0.2):
         # Initialize the Policy (Actor) network
         self.actor = PolicyNetwork(state_dim, action_dim)
         self.actor_old = PolicyNetwork(state_dim, action_dim)
@@ -42,55 +42,51 @@ class PPO:
         # Entropy configuration
         self.entropy_coef = entropy_coef
 
-        # GAE configuration
-        self.lam = lam
-
     def act(self, state):
-        # state: [x, y, v_x, v_y, theta, omega, grounded_left, grounded_right]
-        # Select action based on current policy
+        """Select action based on current policy"""
         with torch.no_grad():
             state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             action, log_prob, _ = self.actor_old.act(state)
         
         return action.item(), log_prob
     
-    def compute_gae(self, rewards, values, masks, next_value):
-        # Concatenate next_value to values
-        values = torch.cat((values, next_value))
+    def criticize(self, state):
+        """Predict the value of a state using the current critic"""
+        with torch.no_grad():
+            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            value = self.critic_old.forward(state)
         
-        # Initialize advantages tensor
-        advantages = torch.zeros_like(rewards).to(self.device)
-        gae = 0
-        
-        # Compute GAE
+        return value
+
+    def compute_returns(self, rewards, masks, next_value):
+        """Calculate the discounted returns"""
+        R = next_value
+        returns = []
+
         for step in reversed(range(len(rewards))):
-            delta = rewards[step] + self.gamma * values[step + 1] * masks[step] - values[step]
-            gae = delta + self.gamma * self.lam * masks[step] * gae
-            advantages[step] = gae
+            R = rewards[step] + self.gamma * R * masks[step]
+            returns.insert(0, R)
+
+        return torch.tensor(returns).to(self.device)
         
-        return advantages
-        
-    def update(self, states, log_probs, rewards, next_states, masks):
+    def update(self, states, log_probs, values, rewards, next_states, masks):
         """Update the policy based on collected experiences"""
         states = states.to(self.device).detach()
-        next_states = next_states.to(self.device).detach()
         log_probs = log_probs.to(self.device).detach()
+        values = values.to(self.device).detach()
+        next_states = next_states.to(self.device).detach()
         rewards = rewards.to(self.device).detach()
         masks = masks.to(self.device).detach()
 
-        # Extract the last action and state
-        last_state = next_states[-1]
-
-        # Compute discounted rewards and GAE advantages
-        values = self.critic(states).squeeze()
-
-        # Compute the value of the first future state, the advantages, and the returns
         with torch.no_grad():
-            future_value = self.critic(last_state)
-            advantages = self.compute_gae(rewards, values, masks, future_value)
+            # Compute the returns
+            future_value = self.critic(next_states[-1])
+            returns = self.compute_returns(rewards, masks, future_value)
+
+            # Compute advantages
+            advantages = returns - values
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            returns = advantages + values
-        
+
         # Initialize accumulators for logging
         total_actor_loss = 0
         total_critic_loss = 0
@@ -114,11 +110,7 @@ class PPO:
 
             # Critic loss
             new_values = self.critic(states).flatten()
-            critic_loss_unclipped = nn.MSELoss()(new_values, returns)
-            # new_values_clipped = values + torch.clamp(new_values-values, -self.eps_clip, self.eps_clip)
-            # critic_loss_clipped = nn.MSELoss()(new_values_clipped, returns)
-            # critic_loss = torch.max(critic_loss_unclipped, critic_loss_clipped)
-            critic_loss = critic_loss_unclipped
+            critic_loss = nn.MSELoss()(new_values, returns)
 
             # Compute the entropy loss
             entropy = (self.entropy_coef * dist_entropy).mean()
@@ -141,10 +133,6 @@ class PPO:
             # Save the gradients before clipping
             total_actor_grad_norms += self.get_avg_grad(self.actor)
             total_critic_grad_norms += self.get_avg_grad(self.critic)
-            
-            # Clip gradients
-            # nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
-            # nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
             
             # Save the gradients after clipping
             total_actor_clip_grad_norms += self.get_avg_grad(self.actor)
