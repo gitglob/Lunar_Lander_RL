@@ -1,78 +1,91 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.nn import functional as F
 from src.utils import calculate_step_statistics
-from .network import PolicyNetwork, ValueNetwork
+from .network import ActorCriticNetwork
 
 class PPO:
     def __init__(self, state_dim, action_dim, 
                  lr=0.001, gamma=0.99, entropy_coef=0.01,
-                 k_epochs=4, eps_clip=0.2):
+                 k_epochs=4, eps_clip=0.2, grad_clip=False,
+                 vf_coef=0.5, vloss_clip=True, use_gae=True, gae_lam=0.95):
         # Initialize the Policy (Actor) network
-        self.actor = PolicyNetwork(state_dim, action_dim)
-        self.actor_old = PolicyNetwork(state_dim, action_dim)
-        
-        # Initialize value function (critic) network
-        self.critic = ValueNetwork(state_dim)
-        self.critic_old = ValueNetwork(state_dim)
+        self.actor_critic = ActorCriticNetwork(state_dim, action_dim)
+        self.actor_critic_old = ActorCriticNetwork(state_dim, action_dim)
 
         # Move policy and value function networks to CUDA
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.actor.to(self.device)
-        self.critic.to(self.device)
-        self.actor_old.to(self.device)
-        self.critic_old.to(self.device)
+        self.actor_critic.to(self.device)
+        self.actor_critic_old.to(self.device)
 
         # Initialize weights
-        self.actor.apply(self.init_orthogonal)
-        self.critic.apply(self.init_orthogonal)
-
-        # Initially copy the weights from the current networks to the old networks
-        self.actor_old.load_state_dict(self.actor.state_dict())
-        self.critic_old.load_state_dict(self.critic.state_dict())
+        self.actor_critic_old.load_state_dict(self.actor_critic.state_dict())
     
         # Initialize the optimizer
         self.lr = lr
-        self.optimizer = optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=self.lr)
+        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=self.lr, eps=1e-5)
         
         # Initialize training parameters
-        self.gamma = gamma        # Discount Factor
-        self.k_epochs = k_epochs  # Number of epochs for updating policy
-        self.eps_clip = eps_clip  # Clipping parameter for PPO
+        self.gamma = gamma           # Discount Factor
+        self.k_epochs = k_epochs     # Number of epochs for updating policy
+        self.eps_clip = eps_clip     # Clipping parameter for PPO
+        self.grad_clip = grad_clip   # Clip gradient or not
+        self.vf_coef = vf_coef       # Value Function Loss coefficient
+        self.vloss_clip = vloss_clip # Clip value loss or not
+        self.use_gae = use_gae       # Flag to use or not GAE
+        self.gae_lam = gae_lam       # GAE coef
 
         # Entropy configuration
         self.entropy_coef = entropy_coef
+
+    def train(self):
+        self.actor_critic.train()
+
+    def eval(self):
+        self.actor_critic.eval()
 
     def act(self, state):
         """Select action based on current policy"""
         with torch.no_grad():
             state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            action, log_prob, _ = self.actor_old.act(state)
+            action, log_prob, _, value = self.actor_critic_old.act(state)
         
-        return action.item(), log_prob
-    
-    def criticize(self, state):
-        """Predict the value of a state using the current critic"""
-        with torch.no_grad():
-            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            value = self.critic_old.forward(state)
-        
-        return value
+        return action.item(), log_prob, value
 
-    def compute_returns(self, rewards, masks, next_value):
+    def compute_returns(self, rewards, masks, values, next_value):
         """Calculate the discounted returns"""
-        R = next_value
-        returns = []
+        returns = torch.zeros_like(values).to(self.device)
 
-        for step in reversed(range(len(rewards))):
-            R = rewards[step] + self.gamma * R * masks[step]
-            returns.insert(0, R)
+        for t in reversed(range(len(returns))):
+            next_return = next_value if t == len(rewards)-1 else values[t+1]
+            returns[t] = rewards[t] + self.gamma * next_return * masks[t]
 
-        return torch.tensor(returns).to(self.device)
+        advantages = returns - values
         
+        return returns, advantages
+        
+    def compute_gae(self, rewards, masks, values, future_value):
+        """Compute the Generalized Advantage Estimation (GAE)"""
+        # Initialize the advantages tensor
+        advantages = torch.zeros_like(values).to(self.device)
+        gae = 0
+        
+        # Iterate in reverse to compute GAE
+        for t in reversed(range(len(advantages))):
+            next_value = future_value if t == len(rewards)-1 else values[t+1]
+            delta = rewards[t] + self.gamma * next_value * masks[t] - values[t]
+            gae = delta + self.gamma * self.gae_lam * masks[t] * gae
+            advantages[t] = gae
+
+        returns = advantages + values
+        
+        return advantages, returns
+
     def compute_kl_divergence(self, old_log_probs, new_log_probs):
         """Compute the KL divergence between old and new log probabilities."""
-        kl_divergence = torch.exp(old_log_probs) * (old_log_probs - new_log_probs)
+        log_ratio = new_log_probs - old_log_probs
+        kl_divergence = torch.mean((torch.exp(log_ratio) - 1) - log_ratio)
         return kl_divergence.mean()
 
     def max_entropy(self, action_dim=4):
@@ -88,36 +101,35 @@ class PPO:
         masks = masks.to(self.device).detach()
 
         with torch.no_grad():
-            # Compute the returns
-            future_value = self.critic(next_states[-1])
-            returns = self.compute_returns(rewards, masks, future_value)
-
-            # Compute advantages
-            advantages = returns - values
+            # Compute returns and advantages
+            _, future_value = self.actor_critic(next_states[-1])
+            if self.use_gae:
+                advantages, returns = self.compute_gae(rewards, masks, values, future_value)
+            else:
+                returns, advantages = self.compute_returns(rewards, masks, values, future_value)
+            # Normalize advantages
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # Initialize accumulators for logging
         total_actor_loss = 0
         total_critic_loss = 0
+        total_entropy_loss = 0
         total_loss = 0
-        total_entropy = 0
-        total_actor_grad_norms = 0
-        total_critic_grad_norms = 0
-        total_actor_clip_grad_norms = 0
-        total_critic_clip_grad_norms = 0
+        total_relative_entropy = 0
+        total_ac_grad_norms = 0
+        total_ac_clip_grad_norms = 0
         total_kl_divergence = 0
         total_residual_variance = 0
 
         # Save current parameters
-        old_actor_params = [param.clone() for param in self.actor.parameters()]
-        old_critic_params = [param.clone() for param in self.critic.parameters()]
+        old_actor_critic_params = [param.clone() for param in self.actor_critic.parameters()]
         
         # Perform policy updates for k epochs
         batch_values = torch.zeros_like(values)
         batch_target_values = torch.zeros_like(values)
         for _ in range(self.k_epochs):
             # Use current policy to predict action, log probs and entropy
-            _, new_log_probs, dist_entropy = self.actor.act(states)
+            _, new_log_probs, dist_entropy, new_values = self.actor_critic.act(states)
 
             # Compute the ratio of the new and old action probabilities
             ratios = torch.exp(new_log_probs - log_probs)
@@ -128,37 +140,47 @@ class PPO:
             actor_loss = -torch.min(surr1, surr2).mean()
 
             # Critic loss
-            new_values = self.critic(states).flatten()
-            critic_loss = nn.MSELoss()(new_values, returns)
+            if self.vloss_clip:
+                diff_unclipped = (new_values - returns) ** 2
+                values_clipped = values + torch.clamp(new_values - values, -self.eps_clip, self.eps_clip)
+                diff_clipped = (values_clipped - returns) ** 2
+                
+                max_diff = torch.max(diff_unclipped, diff_clipped)
+                
+                critic_loss = self.vf_coef * max_diff.mean()
+            else:
+                critic_loss = self.vf_coef*F.mse_loss(new_values, returns)
 
             # Compute the entropy loss
             entropy = (self.entropy_coef * dist_entropy).mean()
             
             # Overall loss
-            loss = actor_loss + 0.5*critic_loss - entropy
-        
-            # Keep the predicted values
-            batch_values += new_values
-            batch_target_values += returns
+            loss = actor_loss + critic_loss - entropy
 
-            # Compute KL divergence
-            kl_divergence = self.compute_kl_divergence(log_probs, new_log_probs)
-            total_kl_divergence += kl_divergence.item()
+            with torch.no_grad():
+                # Keep the predicted values
+                batch_values += new_values
+                batch_target_values += returns
 
-            # Compute residual variance
-            residual_variance = ((returns - new_values).var() / returns.var()).item()
-            total_residual_variance += residual_variance
+                # Compute KL divergence
+                kl_divergence = self.compute_kl_divergence(log_probs, new_log_probs)
+                total_kl_divergence += kl_divergence.item()
 
-            # Compute relative policy entropy
-            policy_entropy = dist_entropy.mean().item()
-            max_ent = self.max_entropy()
-            relative_entropy = policy_entropy / max_ent
-            total_entropy += relative_entropy
-            
-            # Accumulate losses
-            total_actor_loss += actor_loss
-            total_critic_loss += critic_loss
-            total_loss += loss
+                # Compute residual variance
+                residual_variance = ((returns - new_values).var() / returns.var()).item()
+                total_residual_variance += residual_variance
+
+                # Compute relative policy entropy
+                policy_entropy = dist_entropy.mean().item()
+                max_ent = self.max_entropy()
+                relative_entropy = policy_entropy / max_ent
+                total_relative_entropy += relative_entropy
+                
+                # Accumulate losses
+                total_actor_loss += actor_loss
+                total_critic_loss += critic_loss
+                total_entropy_loss += entropy
+                total_loss += loss
             
             # Zero the gradients of the optimizer
             self.optimizer.zero_grad()
@@ -167,29 +189,29 @@ class PPO:
             loss.backward()
             
             # Save the gradients before clipping
-            total_actor_grad_norms += self.get_avg_grad(self.actor)
-            total_critic_grad_norms += self.get_avg_grad(self.critic)
+            total_ac_grad_norms += self.get_avg_grad(self.actor_critic)
             
+            if self.grad_clip:
+                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), 0.5)
+
             # Save the gradients after clipping
-            total_actor_clip_grad_norms += self.get_avg_grad(self.actor)
-            total_critic_clip_grad_norms += self.get_avg_grad(self.critic)
+            total_ac_clip_grad_norms += self.get_avg_grad(self.actor_critic)
 
             # Perform a single optimization step
             self.optimizer.step()
 
         # Calculate step statistics
-        abs_max_actor, mean_square_value_actor = calculate_step_statistics(old_actor_params, self.actor.parameters())
-        abs_max_critic, mean_square_value_critic = calculate_step_statistics(old_critic_params, self.critic.parameters())
+        abs_max_ac, mean_square_value_ac = calculate_step_statistics(old_actor_critic_params, 
+                                                                     self.actor_critic.parameters())
 
         # Compute averages over k_epochs
         avg_actor_loss = total_actor_loss / self.k_epochs
         avg_critic_loss = total_critic_loss / self.k_epochs
+        avg_entropy_loss = total_entropy_loss / self.k_epochs
         self.avg_loss = total_loss / self.k_epochs
-        self.avg_entropy = total_entropy / self.k_epochs
-        avg_actor_grad_norms = total_actor_grad_norms / self.k_epochs
-        avg_critic_grad_norms = total_critic_grad_norms / self.k_epochs
-        avg_actor_clip_grad_norms = total_actor_clip_grad_norms / self.k_epochs
-        avg_critic_clip_grad_norms = total_critic_clip_grad_norms / self.k_epochs
+        avg_relative_entropy = total_relative_entropy / self.k_epochs
+        avg_ac_grad_norms = total_ac_grad_norms / self.k_epochs
+        avg_ac_clip_grad_norms = total_ac_clip_grad_norms / self.k_epochs
         avg_kl_divergence = total_kl_divergence / self.k_epochs
         avg_residual_variance = total_residual_variance / self.k_epochs
         batch_values = batch_values / self.k_epochs
@@ -197,16 +219,21 @@ class PPO:
 
         # Log dictionary
         self.log_dict = {
+            "Advantages/Min": advantages.min(),
+            "Advantages/Max": advantages.max(),
+            "Advantages/Mean": advantages.mean(),
+            "Advantages/Std": advantages.std(),
             "Loss/Total": self.avg_loss,
             "Loss/Actor": avg_actor_loss,
             "Loss/Critic": avg_critic_loss,
-            "Debug/Entropy": self.avg_entropy,
+            "Loss/Entropy": avg_entropy_loss,
+            "Debug/Entropy": avg_relative_entropy,
             "Debug/KL Divergence": avg_kl_divergence,
             "Debug/Residual Variance": avg_residual_variance,
-            "Gradient/Actor": avg_actor_grad_norms,
-            "Gradient/Critic": avg_critic_grad_norms,
-            "Gradient/Clipped Actor": avg_actor_clip_grad_norms,
-            "Gradient/Clipped Critic": avg_critic_clip_grad_norms,
+            "Network/Abs Max": abs_max_ac,
+            "Network/MSE": mean_square_value_ac,
+            "Gradient/AC": avg_ac_grad_norms,
+            "Gradient/Clipped AC": avg_ac_clip_grad_norms,
             "Values/Min": batch_values.min(),
             "Values/Max": batch_values.max(),
             "Values/Mean": batch_values.mean(),
@@ -219,8 +246,7 @@ class PPO:
         }
                 
         # Update old policy and value function networks
-        self.actor_old.load_state_dict(self.actor.state_dict())
-        self.critic_old.load_state_dict(self.critic.state_dict())
+        self.actor_critic_old.load_state_dict(self.actor_critic.state_dict())
 
         # Clear the memory buffer
         self.memory = []
@@ -244,22 +270,13 @@ class PPO:
     def get_lr(self):
         return self.optimizer.param_groups[0]["lr"]
         
-    @staticmethod
-    def init_orthogonal(layer, std=2.0, bias=0.0):
-        if isinstance(layer, nn.Linear):
-            torch.nn.init.orthogonal_(layer.weight, std)
-            if layer.bias is not None:
-                torch.nn.init.constant_(layer.bias, bias)
-
     def load(self, filename):
         checkpoint = torch.load(filename)
-        self.actor.load_state_dict(checkpoint["actor"])
-        self.critic.load_state_dict(checkpoint["critic"])
+        self.actor_critic.load_state_dict(checkpoint["actor_critic"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
 
     def save(self, filename):
         torch.save({
-            "actor": self.actor.state_dict(),
-            "critic": self.critic.state_dict(),
+            "actor_critic": self.actor_critic.state_dict(),
             "optimizer": self.optimizer.state_dict()
         }, filename)
