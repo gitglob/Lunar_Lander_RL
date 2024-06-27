@@ -53,19 +53,24 @@ class PPO:
         
         return action.item(), log_prob, value
 
-    def compute_returns(self, rewards, masks, values, next_value):
+    def compute_returns(self, rewards, dones, values, next_value, next_done):
         """Calculate the discounted returns"""
         returns = torch.zeros_like(values).to(self.device)
 
         for t in reversed(range(len(returns))):
-            next_return = next_value if t == len(rewards)-1 else values[t+1]
-            returns[t] = rewards[t] + self.gamma * next_return * masks[t]
+            if t == len(returns) - 1:
+                next_return = next_value 
+                next_done = next_done 
+            else:
+                next_return = values[t+1]
+                next_done = 1 - dones[t+1]
+            returns[t] = rewards[t] + self.gamma * next_return * next_done
 
         advantages = returns - values
         
         return returns, advantages
         
-    def compute_gae(self, rewards, masks, values, future_value):
+    def compute_gae(self, rewards, dones, values, next_value, next_done):
         """Compute the Generalized Advantage Estimation (GAE)"""
         # Initialize the advantages tensor
         advantages = torch.zeros_like(values).to(self.device)
@@ -73,9 +78,14 @@ class PPO:
         
         # Iterate in reverse to compute GAE
         for t in reversed(range(len(advantages))):
-            next_value = future_value if t == len(rewards)-1 else values[t+1]
-            delta = rewards[t] + self.gamma * next_value * masks[t] - values[t]
-            gae = delta + self.gamma * self.gae_lam * masks[t] * gae
+            if t == len(advantages) - 1:
+                next_value = next_value 
+                next_done = next_done 
+            else:
+                next_value = values[t+1]
+                next_done = 1 - dones[t+1]
+            delta = rewards[t] + self.gamma * next_value * next_done - values[t]
+            gae = delta + self.gamma * self.gae_lam * next_done * gae
             advantages[t] = gae
 
         returns = advantages + values
@@ -91,22 +101,23 @@ class PPO:
     def max_entropy(self, action_dim=4):
         return torch.log(torch.tensor(action_dim, dtype=torch.float32)).item()
 
-    def update(self, states, log_probs, values, rewards, next_states, masks):
+    def update(self, states, log_probs, values, rewards, dones, next_state, next_done):
         """Update the policy based on collected experiences"""
         states = states.to(self.device).detach()
         log_probs = log_probs.to(self.device).detach()
         values = values.to(self.device).detach()
-        next_states = next_states.to(self.device).detach()
         rewards = rewards.to(self.device).detach()
-        masks = masks.to(self.device).detach()
+        dones = dones.to(self.device).detach()
+        next_state = next_state.to(self.device).detach()
+        next_done = next_done.to(self.device).detach()
 
         with torch.no_grad():
             # Compute returns and advantages
-            _, future_value = self.actor_critic(next_states[-1])
+            _, next_value = self.actor_critic(next_state)
             if self.use_gae:
-                advantages, returns = self.compute_gae(rewards, masks, values, future_value)
+                advantages, returns = self.compute_gae(rewards, dones, values, next_value, next_done)
             else:
-                returns, advantages = self.compute_returns(rewards, masks, values, future_value)
+                returns, advantages = self.compute_returns(rewards, dones, values, next_value, next_done)
             # Normalize advantages
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 

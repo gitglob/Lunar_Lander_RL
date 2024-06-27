@@ -4,71 +4,66 @@ import random
 import wandb
 import torch
 import gymnasium as gym
+from gymnasium.wrappers.normalize import NormalizeObservation, NormalizeReward
 from src.utils import corr
 from src.agent import PPO
-from src.normalizer import NormalizedEnv
+SEED = 123
 
 
-def test(agent, env):
+def test(agent):
     """Test the agent in the given environment and log the total reward."""
-    agent.eval()
-    state = env.reset()  # Reset the environment to get the initial state
-    done, truncated = False, False    # Flag to check if the episode has ended
-    total_reward = 0                  # Variable to accumulate the total reward
-    while not (done or truncated):
-        action, _, _ = agent.act(state)      # Get the action from the agent
-        state, reward, done, truncated, info = env.step(action)
-        total_reward += info["real_reward"]  # Accumulate the reward
+    test_env = gym.make("LunarLander-v2", render_mode=None)
+    test_env = NormalizeObservation(test_env)
 
-    return total_reward
+    agent.eval()
+    state = test_env.reset()[0]
+    done, truncated = False, False
+    total_reward = 0
+    while not (done or truncated):
+        action, _, _ = agent.act(state)
+        state, reward, done, truncated, info = test_env.step(action)
+        total_reward += reward
+
+    return reward
 
 def train(env, agent, 
           num_updates, batch_size, 
           save_path, lr_anneal):
     """Train the PPO agent in the given environment."""
+    # Get initial state
+    next_state = env.reset(seed=SEED)[0]
+    next_state = torch.FloatTensor(next_state)
+    next_done = torch.BoolTensor([False])
+    
     # Iterate over the requested updates
-    done, truncated, episode_counter = False, False, 0
     terminal_correlation = 0
     penultimate_terminal_correlation = 0
+    episode_length = 0
+    episode_counter = 0
+    episode_reward = 0
     for update_counter in range(num_updates):
         # Anneal Learning Rate
         if lr_anneal:
             frac = 1.0 - (update_counter - 1.0) / num_updates
             agent.anneal_lr(frac)
 
-        # Get initial state
-        state = env.reset()
-        done, truncated = False, False
-
         # Run batch_size steps
-        episode_reward = 0
-        episode_length = 0
-        batch_states = torch.zeros((batch_size, len(state)))
+        batch_states = torch.zeros((batch_size, len(next_state)))
         batch_action_counts = torch.zeros((4))
         batch_rewards = torch.zeros((batch_size))
-        batch_next_states = torch.zeros((batch_size, len(state)))
-        batch_masks = torch.zeros((batch_size))
+        batch_dones = torch.zeros((batch_size))
         batch_log_probs = torch.zeros((batch_size))
         batch_values = torch.zeros((batch_size))
         agent.train()
         for step in range(batch_size):
-            # Reset environment if the episode terminated
-            if done or truncated:
-                wandb.log({"Episode/Length": episode_length})
-                wandb.log({"Episode/Counter": episode_counter})
-                wandb.log({"Episode/Train Reward": episode_reward})
-                state = env.reset()
-                done, truncated = False, False
-                episode_reward = 0
-                episode_length = 0
-                episode_counter += 1
-            
-            batch_masks[step] = 1 - (done or truncated)
-            
+            episode_length += 1
+            # Save the observations and done masks
+            batch_states[step] = next_state
+            batch_dones[step] = next_done
+
             # Take an action on the real environment with the actor's policy
             # and evaluate it with the critic
-            batch_states[step] = torch.FloatTensor(state)
-            action, log_prob, value = agent.act(state)
+            action, log_prob, value = agent.act(next_state)
             action_counts = torch.bincount(torch.tensor([action]), minlength=4)
             batch_action_counts += action_counts
             batch_log_probs[step] = log_prob
@@ -76,16 +71,22 @@ def train(env, agent,
 
             # Get the rewards from the real environment
             next_state, reward, done, truncated, info = env.step(action)
-            batch_next_states[step] = torch.FloatTensor(next_state)
+            next_state = torch.FloatTensor(next_state)
+            next_done = torch.BoolTensor([done or truncated])
             batch_rewards[step] =  reward
-            episode_reward += info["real_reward"]
-            episode_length += 1
+            episode_reward += reward
 
-            # Advance the state
-            state = next_state
+            # Check for terminal state
+            if done or truncated:
+                episode_counter += 1
+                wandb.log({"Episode/Train Reward": episode_reward})
+                wandb.log({"Episode/Length": episode_length})
+                wandb.log({"Episode/Counter": episode_counter})
+                episode_length = 0
+                episode_reward = 0
 
         # Identify terminal states
-        terminal_indices = (batch_masks == 0).nonzero(as_tuple=False).squeeze()
+        terminal_indices = (batch_dones == 1).nonzero(as_tuple=False).squeeze()
 
         # Calculate terminal and penultimate terminal correlations
         if terminal_indices.dim() != 0 and len(terminal_indices) > 1:
@@ -96,12 +97,13 @@ def train(env, agent,
         agent.update(batch_states, 
                      batch_log_probs, 
                      batch_values,
-                     batch_rewards,
-                     batch_next_states, 
-                     batch_masks)
+                     batch_rewards, 
+                     batch_dones,
+                     next_state,
+                     next_done)
         
         # Run inference to calculate the total reward
-        total_reward = test(agent, env)
+        total_reward = test(agent)
         agent.log_dict["States/Min"] = batch_states.min()
         agent.log_dict["States/Max"] = batch_states.max()
         agent.log_dict["States/Mean"] = batch_states.mean()
@@ -120,22 +122,23 @@ def train(env, agent,
 
         # Log reward every few updates
         if update_counter % 25 == 0:
-            print(f"Episode {episode_counter}, Update {update_counter}/{num_updates},",
-                f"\tReward: {total_reward}")
+            print(f"Episode {update_counter}/{num_updates},",
+                  f"\tReward: {total_reward}")
+            print(f"\tAction counts:", batch_action_counts.tolist())
             agent.save(save_path)
 
 def train_wrapper(run_id):
     # Initialize the Lunar Lander environment 
-    env = gym.make("LunarLander-v2", render_mode=None)
-    env = NormalizedEnv(env)
+    env = gym.make("LunarLander-v2", render_mode=None, max_episode_steps=300)
+    env = gym.wrappers.AutoResetWrapper(env)
+    env = NormalizeObservation(env)
+    env = NormalizeReward(env)
 
     # Seeding
-    SEED = 123
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     torch.backends.cudnn.deterministic = True
-    env.action_space.seed(SEED)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
@@ -183,7 +186,7 @@ def main():
     project_name = "lunar-lander-ppo"
 
     # Initialize wandb
-    run_id = "v23.0.0"
+    run_id = "v28.0.0"
     wandb.init(project=project_name, 
                entity="gitglob", 
                resume='allow', 
@@ -191,10 +194,10 @@ def main():
     
     # Sweep parameters
     wandb.config.update({
-        "batch_size": 1024,#128,
-        "lr": 2.5e-5,#0.01587,
+        "batch_size": 128,
+        "lr": 2.5e-4,
         "gamma": 0.99,
-        "entropy_coef": 0.01,#.1,
+        "entropy_coef": 0.01,
         "vf_coef": 0.5,
         "vloss_clip": True,
         "grad_clip": True,
