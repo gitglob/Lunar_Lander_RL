@@ -24,16 +24,16 @@ def test(agent):
         state, reward, done, truncated, info = test_env.step(action)
         total_reward += reward
 
-    return reward
+    return total_reward
 
 def train(env, agent, 
           num_updates, batch_size, 
           save_path, lr_anneal):
     """Train the PPO agent in the given environment."""
     # Get initial state
-    next_state = env.reset(seed=SEED)[0]
-    next_state = torch.FloatTensor(next_state)
-    next_done = torch.BoolTensor([False])
+    state = env.reset(seed=SEED)[0]
+    state = torch.FloatTensor(state)
+    done = torch.BoolTensor([False])
     
     # Iterate over the requested updates
     terminal_correlation = 0
@@ -48,42 +48,46 @@ def train(env, agent,
             agent.anneal_lr(frac)
 
         # Run batch_size steps
-        batch_states = torch.zeros((batch_size, len(next_state)))
+        batch_states = torch.zeros((batch_size, len(state)))
         batch_action_counts = torch.zeros((4))
         batch_rewards = torch.zeros((batch_size))
-        batch_dones = torch.zeros((batch_size))
+        batch_dones = torch.empty((batch_size), dtype=torch.bool)
         batch_log_probs = torch.zeros((batch_size))
         batch_values = torch.zeros((batch_size))
         agent.train()
         for step in range(batch_size):
             episode_length += 1
             # Save the observations and done masks
-            batch_states[step] = next_state
-            batch_dones[step] = next_done
+            batch_states[step] = state
+            batch_dones[step] = done
 
             # Take an action on the real environment with the actor's policy
             # and evaluate it with the critic
-            action, log_prob, value = agent.act(next_state)
+            action, log_prob, value = agent.act(state)
             action_counts = torch.bincount(torch.tensor([action]), minlength=4)
             batch_action_counts += action_counts
             batch_log_probs[step] = log_prob
             batch_values[step] = value
 
             # Get the rewards from the real environment
-            next_state, reward, done, truncated, info = env.step(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
             next_state = torch.FloatTensor(next_state)
-            next_done = torch.BoolTensor([done or truncated])
+            next_done = torch.BoolTensor([terminated or truncated])
             batch_rewards[step] =  reward
             episode_reward += reward
 
             # Check for terminal state
-            if done or truncated:
+            if next_done:
                 episode_counter += 1
                 wandb.log({"Episode/Train Reward": episode_reward})
                 wandb.log({"Episode/Length": episode_length})
                 wandb.log({"Episode/Counter": episode_counter})
                 episode_length = 0
                 episode_reward = 0
+
+            # Advance the state
+            state = next_state
+            done = next_done
 
         # Identify terminal states
         terminal_indices = (batch_dones == 1).nonzero(as_tuple=False).squeeze()
@@ -122,17 +126,17 @@ def train(env, agent,
 
         # Log reward every few updates
         if update_counter % 25 == 0:
-            print(f"Episode {update_counter}/{num_updates},",
+            print(f"Episode {episode_counter}, Update {update_counter}/{num_updates},",
                   f"\tReward: {total_reward}")
             print(f"\tAction counts:", batch_action_counts.tolist())
             agent.save(save_path)
 
 def train_wrapper(run_id):
     # Initialize the Lunar Lander environment 
-    env = gym.make("LunarLander-v2", render_mode=None, max_episode_steps=300)
+    env = gym.make("LunarLander-v2", render_mode="rgb_array", max_episode_steps=300)
     env = gym.wrappers.AutoResetWrapper(env)
     env = NormalizeObservation(env)
-    env = NormalizeReward(env)
+    # env = NormalizeReward(env)
 
     # Seeding
     random.seed(SEED)
@@ -145,7 +149,6 @@ def train_wrapper(run_id):
     
     # Standard agentparameters
     k_epochs = 4
-    eps_clip = 0.2
     # Sweep parameters
     config = wandb.config
     lr = config.lr
@@ -156,6 +159,7 @@ def train_wrapper(run_id):
     vloss_clip = config.vloss_clip
     use_gae = config.use_gae
     gae_lam = config.gae_lam
+    eps_clip = config.eps_clip
 
     # Initialize the Agent
     agent = PPO(state_dim, action_dim, 
@@ -186,7 +190,7 @@ def main():
     project_name = "lunar-lander-ppo"
 
     # Initialize wandb
-    run_id = "v28.0.0"
+    run_id = "v28.0.6"
     wandb.init(project=project_name, 
                entity="gitglob", 
                resume='allow', 
@@ -195,15 +199,16 @@ def main():
     # Sweep parameters
     wandb.config.update({
         "batch_size": 128,
-        "lr": 2.5e-4,
+        "lr": 0.0003,
+        "eps_clip": 0.25,
         "gamma": 0.99,
-        "entropy_coef": 0.01,
+        "entropy_coef": 0,
         "vf_coef": 0.5,
         "vloss_clip": True,
         "grad_clip": True,
         "lr_anneal": True,
         "use_gae": True,
-        "gae_lam": 0.95
+        "gae_lam": 0.9
     }, allow_val_change=True)
 
     # Train the agent

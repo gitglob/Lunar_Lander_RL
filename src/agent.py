@@ -60,11 +60,11 @@ class PPO:
         for t in reversed(range(len(returns))):
             if t == len(returns) - 1:
                 next_return = next_value 
-                next_done = next_done 
+                next_mask = (~next_done).int() 
             else:
                 next_return = values[t+1]
-                next_done = 1 - dones[t+1]
-            returns[t] = rewards[t] + self.gamma * next_return * next_done
+                next_mask = (~dones[t+1]).int()
+            returns[t] = rewards[t] + self.gamma * next_return * next_mask
 
         advantages = returns - values
         
@@ -80,12 +80,12 @@ class PPO:
         for t in reversed(range(len(advantages))):
             if t == len(advantages) - 1:
                 next_value = next_value 
-                next_done = next_done 
+                next_mask = (~next_done).int() 
             else:
                 next_value = values[t+1]
-                next_done = 1 - dones[t+1]
-            delta = rewards[t] + self.gamma * next_value * next_done - values[t]
-            gae = delta + self.gamma * self.gae_lam * next_done * gae
+                next_mask = (~dones[t+1]).int()
+            delta = rewards[t] + self.gamma * next_value * next_mask - values[t]
+            gae = delta + self.gamma * self.gae_lam * next_mask * gae
             advantages[t] = gae
 
         returns = advantages + values
@@ -160,7 +160,7 @@ class PPO:
                 
                 critic_loss = self.vf_coef * max_diff.mean()
             else:
-                critic_loss = self.vf_coef*F.mse_loss(new_values, returns)
+                critic_loss = self.vf_coef * ((new_values - returns) ** 2).mean()
 
             # Compute the entropy loss
             entropy = (self.entropy_coef * dist_entropy).mean()
