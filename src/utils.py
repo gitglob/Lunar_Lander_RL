@@ -1,12 +1,38 @@
-import numpy as np
+import os
 import torch
 
 
-def corr(x, y):
-    """Compute the correlation between two tensors."""
-    cor = torch.corrcoef(torch.stack((x, y)))[0, 1].item()
+def get_save_subdir(folder_dir):
+    # Check if the folder_dir exists, if not, create it
+    if not os.path.exists(folder_dir):
+        os.makedirs(folder_dir)
+        
+    # List all items in the given directory
+    items = os.listdir(folder_dir)
+    
+    # Filter out only subfolders
+    subfolders = [item for item in items if os.path.isdir(os.path.join(folder_dir, item))]
+    
+    # Convert subfolder names to integers if possible
+    subfolder_ints = []
+    for subfolder in subfolders:
+        try:
+            subfolder_ints.append(int(subfolder))
+        except ValueError:
+            # If conversion fails, just ignore the subfolder
+            continue
+    
+    # Sort the list of integers
+    subfolder_ints.sort()
 
-    return cor
+    # Find the first missing integer
+    current = 0
+    for num in subfolder_ints:
+        if num != current:
+            return str(current)
+        current += 1
+    
+    return os.path.join(folder_dir, str(current))
 
 def calculate_step_statistics(old_params, new_params):
     abs_max = 0

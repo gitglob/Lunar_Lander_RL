@@ -1,5 +1,7 @@
 checkpoints/*
 !checkpoints/.gitkeep 
+videos
+!videos/.gitkeep 
 
 wandb
 

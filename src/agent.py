@@ -1,30 +1,25 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.nn import functional as F
+from torch.distributions import Categorical
 from src.utils import calculate_step_statistics
 from .network import ActorCriticNetwork
 
 class PPO:
-    def __init__(self, state_dim, action_dim, 
+    def __init__(self, state_dim=8, action_dim=4, 
                  lr=0.001, gamma=0.99, entropy_coef=0.01,
                  k_epochs=4, eps_clip=0.2, grad_clip=False,
                  vf_coef=0.5, vloss_clip=True, use_gae=True, gae_lam=0.95):
         # Initialize the Policy (Actor) network
         self.actor_critic = ActorCriticNetwork(state_dim, action_dim)
-        self.actor_critic_old = ActorCriticNetwork(state_dim, action_dim)
 
         # Move policy and value function networks to CUDA
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.actor_critic.to(self.device)
-        self.actor_critic_old.to(self.device)
-
-        # Initialize weights
-        self.actor_critic_old.load_state_dict(self.actor_critic.state_dict())
-    
+  
         # Initialize the optimizer
         self.lr = lr
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=self.lr, eps=1e-5)
+        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=self.lr)
         
         # Initialize training parameters
         self.gamma = gamma           # Discount Factor
@@ -45,13 +40,22 @@ class PPO:
     def eval(self):
         self.actor_critic.eval()
 
+    def best_act(self, state):
+        """Select action based on current policy"""
+        with torch.no_grad():
+            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            action = self.actor_critic.best_act(state)
+        
+        return action.item()
+
     def act(self, state):
         """Select action based on current policy"""
         with torch.no_grad():
             state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            action, log_prob, _, value = self.actor_critic_old.act(state)
+            action, log_prob, _ = self.actor_critic.act(state)
+            value = self.actor_critic.value(state)
         
-        return action.item(), log_prob, value
+        return action.item(), log_prob.item(), value.flatten().item()
 
     def compute_returns(self, rewards, dones, values, next_value, next_done):
         """Calculate the discounted returns"""
@@ -84,6 +88,7 @@ class PPO:
             else:
                 next_value = values[t+1]
                 next_mask = (~dones[t+1]).int()
+
             delta = rewards[t] + self.gamma * next_value * next_mask - values[t]
             gae = delta + self.gamma * self.gae_lam * next_mask * gae
             advantages[t] = gae
@@ -101,9 +106,10 @@ class PPO:
     def max_entropy(self, action_dim=4):
         return torch.log(torch.tensor(action_dim, dtype=torch.float32)).item()
 
-    def update(self, states, log_probs, values, rewards, dones, next_state, next_done):
+    def update(self, states, actions, log_probs, values, rewards, dones, next_state, next_done):
         """Update the policy based on collected experiences"""
         states = states.to(self.device).detach()
+        actions = actions.to(self.device).detach()
         log_probs = log_probs.to(self.device).detach()
         values = values.to(self.device).detach()
         rewards = rewards.to(self.device).detach()
@@ -113,7 +119,7 @@ class PPO:
 
         with torch.no_grad():
             # Compute returns and advantages
-            _, next_value = self.actor_critic(next_state)
+            next_value = self.actor_critic.value(next_state)
             if self.use_gae:
                 advantages, returns = self.compute_gae(rewards, dones, values, next_value, next_done)
             else:
@@ -139,8 +145,11 @@ class PPO:
         batch_values = torch.zeros_like(values)
         batch_target_values = torch.zeros_like(values)
         for _ in range(self.k_epochs):
-            # Use current policy to predict action, log probs and entropy
-            _, new_log_probs, dist_entropy, new_values = self.actor_critic.act(states)
+            # Use current policy to get the probability of the memory actions
+            action_logits = self.actor_critic.policy(states)
+            dist = Categorical(logits=action_logits)
+            dist_entropy = dist.entropy()
+            new_log_probs = dist.log_prob(actions)
 
             # Compute the ratio of the new and old action probabilities
             ratios = torch.exp(new_log_probs - log_probs)
@@ -149,6 +158,9 @@ class PPO:
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
             actor_loss = -torch.min(surr1, surr2).mean()
+
+            # Use the current value network to get the new values
+            new_values = self.actor_critic.value(states).flatten()
 
             # Critic loss
             if self.vloss_clip:
@@ -219,7 +231,7 @@ class PPO:
         avg_actor_loss = total_actor_loss / self.k_epochs
         avg_critic_loss = total_critic_loss / self.k_epochs
         avg_entropy_loss = total_entropy_loss / self.k_epochs
-        self.avg_loss = total_loss / self.k_epochs
+        avg_loss = total_loss / self.k_epochs
         avg_relative_entropy = total_relative_entropy / self.k_epochs
         avg_ac_grad_norms = total_ac_grad_norms / self.k_epochs
         avg_ac_clip_grad_norms = total_ac_clip_grad_norms / self.k_epochs
@@ -230,21 +242,6 @@ class PPO:
 
         # Log dictionary
         self.log_dict = {
-            "Advantages/Min": advantages.min(),
-            "Advantages/Max": advantages.max(),
-            "Advantages/Mean": advantages.mean(),
-            "Advantages/Std": advantages.std(),
-            "Loss/Total": self.avg_loss,
-            "Loss/Actor": avg_actor_loss,
-            "Loss/Critic": avg_critic_loss,
-            "Loss/Entropy": avg_entropy_loss,
-            "Debug/Entropy": avg_relative_entropy,
-            "Debug/KL Divergence": avg_kl_divergence,
-            "Debug/Residual Variance": avg_residual_variance,
-            "Network/Abs Max": abs_max_ac,
-            "Network/MSE": mean_square_value_ac,
-            "Gradient/AC": avg_ac_grad_norms,
-            "Gradient/Clipped AC": avg_ac_clip_grad_norms,
             "Values/Min": batch_values.min(),
             "Values/Max": batch_values.max(),
             "Values/Mean": batch_values.mean(),
@@ -253,15 +250,24 @@ class PPO:
             "Target Values/Max": batch_target_values.max(),
             "Target Values/Mean": batch_target_values.mean(),
             "Target Values/Std": batch_target_values.std(),
+            "Advantages/Min": advantages.min(),
+            "Advantages/Max": advantages.max(),
+            "Advantages/Mean": advantages.mean(),
+            "Advantages/Std": advantages.std(),
+            "Loss/Actor": avg_actor_loss,
+            "Loss/Critic": avg_critic_loss,
+            "Loss/Entropy": avg_entropy_loss,
+            "Loss/Total": avg_loss,
+            "Gradient/AC": avg_ac_grad_norms,
+            "Gradient/Clipped AC": avg_ac_clip_grad_norms,
+            "Network/Abs Max": abs_max_ac,
+            "Network/MSE": mean_square_value_ac,
+            "Debug/Entropy": avg_relative_entropy,
+            "Debug/KL Divergence": avg_kl_divergence,
+            "Debug/Residual Variance": 1 - avg_residual_variance,
             "Config/Learning Rate": self.get_lr(),
         }
                 
-        # Update old policy and value function networks
-        self.actor_critic_old.load_state_dict(self.actor_critic.state_dict())
-
-        # Clear the memory buffer
-        self.memory = []
-
     @staticmethod
     def get_avg_grad(network):
         grad_norms = []
@@ -285,6 +291,7 @@ class PPO:
         checkpoint = torch.load(filename)
         self.actor_critic.load_state_dict(checkpoint["actor_critic"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.lr = self.optimizer.param_groups[0]["lr"]
 
     def save(self, filename):
         torch.save({

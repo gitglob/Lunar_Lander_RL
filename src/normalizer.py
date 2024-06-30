@@ -31,7 +31,7 @@ def update_mean_var_count_from_moments(mean, var, count, batch_mean, batch_var, 
 
     return new_mean, new_var, new_count
 
-class NormalizedEnv(gym.core.Wrapper):
+class NormalizedEnv(gym.Wrapper):
     def __init__(self, env, ob=True, ret=True, clipob=10., cliprew=10., gamma=0.99, epsilon=1e-8):
         super(NormalizedEnv, self).__init__(env)
         self.ob_rms = RunningMeanStd(shape=self.observation_space.shape) if ob else None
@@ -62,7 +62,7 @@ class NormalizedEnv(gym.core.Wrapper):
         else:
             return obs
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
         self.ret = np.zeros(())
         obs = self.env.reset()[0]
-        return self._obfilt(obs)
+        return [self._obfilt(obs)]
