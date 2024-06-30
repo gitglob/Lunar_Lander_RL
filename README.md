@@ -44,7 +44,7 @@ I also run a sweep to compare higher and lower batch sizes and how they interact
     <td><img src="resources/sweep_relative_entropy.png" width="300"></td>
     <td><img src="resources/sweep_residual_variance.png" width="300"></td>
   </tr>
-<table>
+</table>
 
 # Limitations
 The current agent was trained on a single lunar lander environment, which made it "overfit" to it and not be able to generalize when presented with environments with different random seeds and thus, starting states.
