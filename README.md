@@ -5,9 +5,7 @@ This is a practice project that solves the [lunar lander environment](https://gy
 This is a video showcasing the agent's progress every ~5000 steps, with the last video reflecting the final agent's capabilities.
 Sorry for not removing the watermark :').
 
-<video width="720" height="480" controls>
-  <source src="resources/lunar_lander_progress.mp4" type="video/mp4">
-</video>
+![Lunar Lander](https://github.com/gitglob/Lunar_Lander_RL/tree/main/resources/lunar_lander_progress.gif)
 
 # Logging
 
