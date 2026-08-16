@@ -44,17 +44,6 @@ I also run a sweep to compare higher and lower batch sizes and how they interact
   </tr>
 </table>
 
-# Limitations
-The current agent was trained on a single lunar lander environment, which made it "overfit" to it and not be able to generalize when presented with environments with different random seeds and thus, starting states.
-This is easily seen by the "test reward" metric here.
-
-
-<tr>
-<td><img src="resources/test_reward.png" width="600"></td>
-</tr>
-
-To avoid that and create an actually generalizable agent (at least within the lunar lander context), one should train using parallel vectorized environments as shown [here](https://gymnasium.farama.org/tutorials/gymnasium_basics/vector_envs_tutorial/). This, however, is out of the scope of this project. This should make the agent able to handle a more diverse set of states and especially, initial conditions.
-
 # Sources
 To build and debug the agent I mainly read and followed the instructions of the following 2 papers and 1 blog:
 1. [IMPLEMENTATION MATTERS IN DEEP POLICY GRADIENTS: A CASE STUDY ON PPO AND TRPO](https://arxiv.org/pdf/2005.12729)
