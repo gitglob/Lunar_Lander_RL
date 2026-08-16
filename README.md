@@ -1,5 +1,5 @@
 # Lunar Lander using RL (PPO actor-critic)
-This is a practice project that solves the [lunar lander environment](https://gymnasium.farama.org/environments/box2d/lunar_lander/) using Procimal Policy Optimization (PPO).
+From-scratch implementation and empirical study of Proximal Policy Optimization (PPO) on [lunar lander](https://gymnasium.farama.org/environments/box2d/lunar_lander/), focusing on implementation details, training stability, and policy evaluation.
 
 # Solution progress
 This is a video showcasing the agent's progress every ~5000 steps, with the last video reflecting the final agent's capabilities.
